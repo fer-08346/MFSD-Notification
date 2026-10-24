@@ -14,6 +14,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -74,7 +75,7 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(20), dp(20), dp(32))
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
         }
-        scroll.addView(root, ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        scroll.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         setContentView(scroll)
         if (Build.VERSION.SDK_INT >= 35) {
             @Suppress("DEPRECATION")
