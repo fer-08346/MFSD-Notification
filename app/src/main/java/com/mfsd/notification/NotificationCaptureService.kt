@@ -7,10 +7,27 @@ import android.service.notification.StatusBarNotification
 import android.text.TextUtils
 import java.util.Locale
 
-/** Recibe las notificaciones que Android autoriza a esta aplicación a consultar. */
+/** Recibe y procesa las notificaciones de Android. */
 class NotificationCaptureService : NotificationListenerService() {
+
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        // Al conectar el servicio, capturamos las notificaciones ya presentes en el sistema
+        // para que no se omitan en el historial ni en los resúmenes.
+        try {
+            val active = activeNotifications ?: return
+            for (sbn in active) {
+                processNotification(sbn, canSpeakInstantly = false)
+            }
+        } catch (_: Exception) { }
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         super.onNotificationPosted(sbn)
+        processNotification(sbn, canSpeakInstantly = true)
+    }
+
+    private fun processNotification(sbn: StatusBarNotification, canSpeakInstantly: Boolean) {
         if (sbn.packageName == packageName) return
 
         val prefs = NotificationStore.prefs(this)
@@ -19,19 +36,36 @@ class NotificationCaptureService : NotificationListenerService() {
         val instantRead = prefs.getBoolean(NotificationStore.KEY_READ_INSTANTLY, true)
         val summaryEnabled = prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)
         if (!instantRead && !summaryEnabled) return
-        val readInstantlyForThisApp = instantRead &&
-            sbn.packageName in NotificationStore.selectedPackages(this)
-        // Las notificaciones permanentes (reproducción, servicios en primer plano, etc.)
-        // se excluyen porque pueden actualizarse muchas veces por minuto.
-        if ((sbn.notification.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
 
+        // Omitir únicamente notificaciones de reproducción multimedia activa
         val extras = sbn.notification.extras
+        val isMediaPlayback = extras?.containsKey(Notification.EXTRA_MEDIA_SESSION) == true ||
+            sbn.notification.category == Notification.CATEGORY_TRANSPORT
+        if (isMediaPlayback) return
+
+        // Extraer título
         val rawTitle = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty().trim()
+
+        // Extraer texto revisando múltiples estilos y campos posibles
         val rawText = when {
-            extras?.getCharSequence(Notification.EXTRA_BIG_TEXT) != null -> extras.getCharSequence(Notification.EXTRA_BIG_TEXT).toString()
-            extras?.getCharSequence(Notification.EXTRA_TEXT) != null -> extras.getCharSequence(Notification.EXTRA_TEXT).toString()
+            extras?.getCharSequence(Notification.EXTRA_BIG_TEXT) != null ->
+                extras.getCharSequence(Notification.EXTRA_BIG_TEXT).toString()
+            extras?.getCharSequence(Notification.EXTRA_TEXT) != null ->
+                extras.getCharSequence(Notification.EXTRA_TEXT).toString()
+            extras?.getCharSequenceArray(Notification.EXTRA_TEXT_LINES) != null -> {
+                val lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+                lines?.filterNotNull()?.takeLast(3)?.joinToString(". ") { it.toString() } ?: ""
+            }
+            extras?.getCharSequence(Notification.EXTRA_SUB_TEXT) != null ->
+                extras.getCharSequence(Notification.EXTRA_SUB_TEXT).toString()
+            extras?.getCharSequence(Notification.EXTRA_INFO_TEXT) != null ->
+                extras.getCharSequence(Notification.EXTRA_INFO_TEXT).toString()
             else -> ""
         }.trim()
+
+        // Si no hay ningún contenido textual, omitir
+        if (rawTitle.isBlank() && rawText.isBlank()) return
+
         val appLabel = try {
             val info = packageManager.getApplicationInfo(sbn.packageName, 0)
             packageManager.getApplicationLabel(info).toString()
@@ -56,16 +90,24 @@ class NotificationCaptureService : NotificationListenerService() {
             packageName = sbn.packageName,
             appName = appLabel,
             title = rawTitle.take(140),
-            text = rawText.take(300),
+            text = rawText.take(400),
             postedAt = System.currentTimeMillis(),
             whatsappKind = groupKind,
             visibleMessageCount = messageCount
         )
 
-        // Los resúmenes reúnen todas las aplicaciones, no solo las marcadas para lectura inmediata.
+        // Registrar para el resumen y el historial
         if (summaryEnabled) NotificationStore.add(this, record)
-        if (readInstantlyForThisApp) {
-            val speech = if (rawTitle.isBlank() && rawText.isBlank()) "$appLabel. Llegó una notificación." else record.spokenText()
+
+        // Lectura al instante si la aplicación está seleccionada
+        val isAppSelected = sbn.packageName in NotificationStore.selectedPackages(this)
+        if (canSpeakInstantly && instantRead && isAppSelected) {
+            val mode = prefs.getString(NotificationStore.KEY_INSTANT_MODE, NotificationStore.INSTANT_MODE_FULL)
+            val speech = if (mode == NotificationStore.INSTANT_MODE_BRIEF) {
+                record.spokenBrief()
+            } else {
+                record.spokenText()
+            }
             TtsSpeaker.speak(this, speech)
         }
     }

@@ -32,12 +32,22 @@ data class NotificationRecord(
         put("visibleMessageCount", visibleMessageCount)
     }
 
+    /** Lectura completa: aplicación, remitente/título y cuerpo del mensaje. */
     fun spokenText(): String {
         val parts = mutableListOf<String>()
         parts.add(appName)
         if (title.isNotBlank() && !title.equals(appName, ignoreCase = true)) parts.add(title)
         if (text.isNotBlank()) parts.add(text)
         return parts.joinToString(". ")
+    }
+
+    /** Resumen breve: solo aplicación y remitente o título. */
+    fun spokenBrief(): String {
+        return if (title.isNotBlank() && !title.equals(appName, ignoreCase = true)) {
+            "$appName: $title"
+        } else {
+            "$appName. Nueva notificación"
+        }
     }
 
     companion object {
@@ -62,10 +72,14 @@ object NotificationStore {
     const val KEY_SUMMARY_ENABLED = "summary_enabled"
     const val KEY_TTS_ENGINE = "tts_engine"
     const val KEY_AUDIO_MODE = "audio_mode"
+    const val KEY_INSTANT_MODE = "instant_read_mode"
+    const val INSTANT_MODE_FULL = "full"
+    const val INSTANT_MODE_BRIEF = "brief"
+    const val KEY_KEEP_ALIVE = "keep_alive"
     const val KEY_EVENTS = "notification_events"
     const val KEY_LAST_SUMMARY_AT = "last_summary_at"
     const val KEY_SCHEDULER_INITIALIZED = "scheduler_initialized"
-    private const val MAX_EVENTS = 500
+    private const val MAX_EVENTS = 1000
     private val lock = Any()
 
     fun prefs(context: Context): SharedPreferences =
@@ -136,7 +150,7 @@ object NotificationStore {
         val currentTime = DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault()).format(Date())
         val header = if (includeTime) "Resumen de MFSD Notification, hora $currentTime." else "Resumen de MFSD Notification."
         if (source.isEmpty()) {
-            return "$header Durante los últimos treinta minutos no llegaron notificaciones registrables de las aplicaciones del teléfono."
+            return "$header Durante los últimos treinta minutos no llegaron notificaciones nuevas."
         }
 
         // Para una misma notificación agrupada, se toma la versión más reciente del intervalo.
@@ -153,8 +167,10 @@ object NotificationStore {
             }
             .sortedByDescending { it.second }
 
-        val opening = "$header En los últimos treinta minutos se detectaron ${records.size} notificaciones en ${byApp.size} aplicaciones."
-        val appBreakdown = appCounts.take(6).joinToString(". ") { (name, count, _) -> "$name: $count avisos" }
+        val opening = "$header Se registraron ${records.size} notificaciones en ${byApp.size} aplicaciones."
+        // Desglose de todas las aplicaciones registradas
+        val appBreakdown = appCounts.joinToString(". ") { (name, count, _) -> "$name: $count avisos" }
+
         val whatsapp = records.filter { it.packageName == "com.whatsapp" || it.packageName == "com.whatsapp.w4b" }
         val whatsappText = if (whatsapp.isEmpty()) "" else {
             val groups = whatsapp.filter { it.whatsappKind == 1 }.sumOf { it.visibleMessageCount }
@@ -164,22 +180,23 @@ object NotificationStore {
             if (groups > 0) bits.add("aproximadamente $groups mensajes visibles de grupos")
             if (chats > 0) bits.add("aproximadamente $chats mensajes visibles de chats individuales")
             if (unknown > 0) bits.add("$unknown mensajes o avisos de WhatsApp que no pude clasificar")
-            if (bits.isEmpty()) "" else "En WhatsApp detecté ${bits.joinToString(" y ")}. Android no siempre distingue los grupos ni expone todos los mensajes."
+            if (bits.isEmpty()) "" else "En WhatsApp detecté ${bits.joinToString(" y ")}."
         }
 
         val examples = records.asReversed()
             .filter { it.text.isNotBlank() || it.title.isNotBlank() }
-            .filterNot { it.packageName == "com.whatsapp" || it.packageName == "com.whatsapp.w4b" }
-            .take(3)
+            .take(5)
             .joinToString(". ") { record ->
-                val headline = if (record.title.isNotBlank() && !record.title.equals(record.appName, true)) record.title else record.appName
-                val body = record.text.take(160)
+                val headline = if (record.title.isNotBlank() && !record.title.equals(record.appName, true)) {
+                    "${record.appName}, ${record.title}"
+                } else record.appName
+                val body = record.text.take(150)
                 if (body.isBlank()) headline else "$headline: $body"
             }
 
-        return listOf(opening, appBreakdown, whatsappText, if (examples.isNotBlank()) "Últimos avisos: $examples" else "")
+        return listOf(opening, appBreakdown, whatsappText, if (examples.isNotBlank()) "Últimos detalles: $examples" else "")
             .filter { it.isNotBlank() }
             .joinToString(". ")
-            .take(1200)
+            .take(2000)
     }
 }

@@ -1,19 +1,23 @@
 package com.mfsd.notification
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
+import android.speech.tts.TextToSpeech
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityEvent
 import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -21,7 +25,8 @@ import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
-import android.speech.tts.TextToSpeech
+import java.text.DateFormat
+import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
@@ -31,38 +36,45 @@ class MainActivity : Activity() {
     private lateinit var accessStatus: TextView
     private lateinit var masterStatus: TextView
     private lateinit var masterControlButton: Button
-    private lateinit var selectedAppsContainer: LinearLayout
+    private lateinit var appsSummaryStatus: TextView
     private lateinit var summarySwitch: Switch
     private lateinit var instantSwitch: Switch
+    private lateinit var keepAliveSwitch: Switch
     private var appEnabled = true
-    private lateinit var appChoices: List<AppChoice>
-    private lateinit var engineChoices: List<EngineChoice>
-    private var buildingAppList = false
+    private var appChoices: List<AppChoice> = emptyList()
+    private var engineChoices: List<EngineChoice> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         title = getString(R.string.app_name)
         appEnabled = NotificationStore.prefs(this)
             .getBoolean(NotificationStore.KEY_MASTER_ENABLED, true)
+
         createInterface()
-        loadAppChoicesAndChecks()
+        loadAppChoices()
         loadEngines()
         refreshAccessStatus()
 
         val prefs = NotificationStore.prefs(this)
-        if (appEnabled && prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)) {
-            if (!prefs.getBoolean(NotificationStore.KEY_SCHEDULER_INITIALIZED, false)) {
-                SummaryScheduler.startFromNow(this)
+        if (appEnabled) {
+            if (prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)) {
+                if (!prefs.getBoolean(NotificationStore.KEY_SCHEDULER_INITIALIZED, false)) {
+                    SummaryScheduler.startFromNow(this)
+                }
+            }
+            if (prefs.getBoolean(NotificationStore.KEY_KEEP_ALIVE, true)) {
+                KeepAliveService.start(this)
             }
         } else {
             SummaryScheduler.stop(this)
+            KeepAliveService.stop(this)
         }
     }
 
     override fun onResume() {
         super.onResume()
         if (::accessStatus.isInitialized) refreshAccessStatus()
-        if (::selectedAppsContainer.isInitialized) loadAppChoicesAndChecks()
+        loadAppChoices()
     }
 
     private fun createInterface() {
@@ -77,6 +89,7 @@ class MainActivity : Activity() {
         }
         scroll.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         setContentView(scroll)
+
         if (Build.VERSION.SDK_INT >= 35) {
             @Suppress("DEPRECATION")
             scroll.setOnApplyWindowInsetsListener { view, insets ->
@@ -99,8 +112,8 @@ class MainActivity : Activity() {
         }
         root.addView(heading, matchWrap())
         addText(root, "Lee en voz alta las notificaciones que elijas y reúne un resumen cada media hora. La voz se configura aparte de la que utiliza tu lector de pantalla.", 17f)
-        addText(root, "La aplicación usa la fecha y hora del teléfono. Los resúmenes pueden retrasarse si Android limita la actividad en segundo plano.", 15f)
 
+        // CONTROL GENERAL
         root.addView(sectionTitle("Control general"))
         masterStatus = addText(root, masterStatusText(), 17f)
         masterControlButton = button(masterButtonText()) {
@@ -108,27 +121,57 @@ class MainActivity : Activity() {
         }
         masterControlButton.contentDescription = masterButtonText()
         root.addView(masterControlButton, matchWrap())
-        addText(root, "Al desactivarla, detiene la lectura que esté sonando y pausa tanto la lectura inmediata como los resúmenes. Al volver a activarla, empieza un nuevo periodo: no leerá notificaciones anteriores a la pausa.", 15f)
+        addText(root, "Al desactivarla, detiene la voz inmediatamente y pausa la captura y los resúmenes. Al reactivarla, comienza un nuevo periodo.", 15f)
 
-        root.addView(sectionTitle("Permisos"))
+        // EJECUCIÓN EN SEGUNDO PLANO
+        root.addView(sectionTitle("Segundo plano y confiabilidad"))
+        keepAliveSwitch = Switch(this).apply {
+            text = "Mantener activa en segundo plano permanentemente"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_KEEP_ALIVE, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_KEEP_ALIVE, checked).apply()
+                if (checked && appEnabled) {
+                    KeepAliveService.start(this@MainActivity)
+                    toast("Servicio en segundo plano activado.")
+                } else {
+                    KeepAliveService.stop(this@MainActivity)
+                    toast("Servicio en segundo plano detenido.")
+                }
+            }
+        }
+        root.addView(keepAliveSwitch, matchWrap())
+
+        root.addView(button("Permitir segundo plano sin restricciones (batería)") {
+            requestBatteryOptimizationExemption()
+        })
+        addText(root, "Recomendado: desactiva las restricciones de batería para que el teléfono no congele la app cuando la pantalla esté apagada.", 15f)
+
+        // PERMISOS
+        root.addView(sectionTitle("Permisos del sistema"))
         accessStatus = addText(root, "Estado del acceso a notificaciones: comprobando.", 16f)
         root.addView(button("Conceder o revisar acceso a notificaciones") {
             try {
                 startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
             } catch (_: Exception) {
-                toast("No pude abrir ese ajuste. Búscalo en Ajustes de Android, acceso a notificaciones.")
+                toast("Búscalo en Ajustes de Android > Acceso a notificaciones.")
             }
         })
         root.addView(button("Abrir ajustes de texto a voz de Android") {
             try {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                toast("En Accesibilidad, busca Salida de texto a voz para instalar o configurar motores de voz.")
+                toast("En Accesibilidad, busca Salida de texto a voz para ver tus motores instalados.")
             } catch (_: Exception) {
                 toast("Abre Ajustes de Android y busca Salida de texto a voz.")
             }
         })
 
-        root.addView(sectionTitle("Cómo quieres recibir las notificaciones"))
+        // FORMAS DE LECTURA
+        root.addView(sectionTitle("Modos de lectura"))
         instantSwitch = Switch(this).apply {
             text = "Leer al instante las aplicaciones seleccionadas"
             textSize = 17f
@@ -143,6 +186,27 @@ class MainActivity : Activity() {
         }
         root.addView(instantSwitch, matchWrap())
 
+        root.addView(label("¿Cómo quieres que lea al instante?"))
+        val instantModeSpinner = Spinner(this).apply {
+            contentDescription = "Detalle de la lectura al instante"
+            minimumHeight = dp(52)
+        }
+        val instantModeOptions = listOf(
+            "Notificación completa (aplicación, remitente y mensaje)",
+            "Resumen breve (solo aplicación y remitente o título)"
+        )
+        val instantModeAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, instantModeOptions)
+        instantModeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        instantModeSpinner.adapter = instantModeAdapter
+        val storedInstantMode = NotificationStore.prefs(this)
+            .getString(NotificationStore.KEY_INSTANT_MODE, NotificationStore.INSTANT_MODE_FULL)
+        instantModeSpinner.setSelection(if (storedInstantMode == NotificationStore.INSTANT_MODE_BRIEF) 1 else 0, false)
+        instantModeSpinner.onItemSelectedListener = SimpleItemSelectedListener { position ->
+            val mode = if (position == 1) NotificationStore.INSTANT_MODE_BRIEF else NotificationStore.INSTANT_MODE_FULL
+            NotificationStore.prefs(this).edit().putString(NotificationStore.KEY_INSTANT_MODE, mode).apply()
+        }
+        root.addView(instantModeSpinner, matchWrap())
+
         summarySwitch = Switch(this).apply {
             text = "Leer un resumen cada 30 minutos"
             textSize = 17f
@@ -156,8 +220,8 @@ class MainActivity : Activity() {
                 if (checked && appEnabled) SummaryScheduler.startFromNow(this@MainActivity)
                 else SummaryScheduler.stop(this@MainActivity)
                 val message = when {
-                    checked && appEnabled -> "Resumen activado. El próximo se intentará dentro de 30 minutos."
-                    checked -> "El resumen está seleccionado, pero MFSD Notification está desactivada. Actívala para que funcione."
+                    checked && appEnabled -> "Resumen activado cada 30 minutos."
+                    checked -> "Resumen activado, pero MFSD Notification está en pausa. Actívala para iniciar."
                     else -> "Resumen desactivado."
                 }
                 toast(message)
@@ -165,49 +229,62 @@ class MainActivity : Activity() {
         }
         root.addView(summarySwitch, matchWrap())
 
+        // CONFIGURACIÓN DE VOZ
         root.addView(sectionTitle("Voz independiente"))
-        addText(root, "Motor de síntesis de voz. Solo aparecen motores instalados que Android permite usar como texto a voz. Eloquence aparecerá si está instalado y registrado como motor.", 15f)
+        addText(root, "Selecciona el motor de voz deseado (como Eloquence, Vocalizer o Samsung) y el volumen a emplear.", 15f)
         root.addView(label("Motor de voz para MFSD Notification"))
         val engineSpinner = Spinner(this).apply {
-            contentDescription = "Motor de voz para las notificaciones de MFSD Notification"
+            tag = "engine_spinner"
+            contentDescription = "Motor de voz para las notificaciones"
             minimumHeight = dp(52)
         }
         root.addView(engineSpinner, matchWrap())
+
         root.addView(label("Volumen que debe utilizar la voz"))
         val audioSpinner = Spinner(this).apply {
-            contentDescription = "Tipo de volumen de la voz de las notificaciones"
+            tag = "audio_spinner"
+            contentDescription = "Canal de audio de la voz"
             minimumHeight = dp(52)
         }
         root.addView(audioSpinner, matchWrap())
-        root.addView(button("Probar la voz elegida") {
+
+        root.addView(button("Probar la voz seleccionada") {
             if (!appEnabled) {
                 toast("MFSD Notification está desactivada. Actívala para probar la voz.")
             } else {
-                TtsSpeaker.speak(this, "Esta es una prueba de voz de MFSD Notification. Si escuchas este mensaje, el motor está respondiendo.")
+                TtsSpeaker.speak(this, "Esta es una prueba de voz de MFSD Notification. Si escuchas este mensaje, el motor funciona correctamente.")
                 toast("Prueba de voz enviada.")
             }
         })
 
+        // APLICACIONES PARA LECTURA INMEDIATA (OPTIMIZADA PARA ACCESIBILIDAD)
         root.addView(sectionTitle("Aplicaciones para lectura inmediata"))
-        addText(root, "Marca las aplicaciones cuyas notificaciones quieres que se lean apenas lleguen. El resumen de cada media hora incluye notificaciones de todas las aplicaciones, aunque no estén marcadas aquí. Las apps que ya hayan enviado un aviso pueden aparecer en esta lista aunque no tengan un icono en el lanzador.", 15f)
-        root.addView(button("Seleccionar todas para lectura inmediata") {
+        addText(root, "Elige las aplicaciones que se leerán al instante cuando llegue un aviso. El resumen de cada media hora reunirá todas las aplicaciones del teléfono.", 15f)
+
+        appsSummaryStatus = addText(root, "Cargando aplicaciones...", 16f)
+
+        root.addView(button("Elegir aplicaciones para lectura inmediata...") {
+            showAppSelectionDialog()
+        })
+        root.addView(button("Seleccionar todas las aplicaciones") {
             NotificationStore.saveSelectedPackages(this, appChoices.map { it.packageName }.toSet())
-            loadAppChoicesAndChecks()
-            toast("Todas las aplicaciones de la lista se leerán al instante.")
+            updateAppSummaryText()
+            toast("Todas las aplicaciones se leerán al instante.")
         })
         root.addView(button("Desmarcar todas las aplicaciones") {
             NotificationStore.saveSelectedPackages(this, emptySet())
-            loadAppChoicesAndChecks()
-            toast("No se leerán avisos al instante; el resumen seguirá incluyendo todas las aplicaciones.")
+            updateAppSummaryText()
+            toast("No se leerán avisos al instante; se reservan para el resumen.")
         })
-        selectedAppsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-        }
-        root.addView(selectedAppsContainer, matchWrap())
 
-        root.addView(sectionTitle("Resumen e historial"))
-        root.addView(button("Leer una muestra del resumen acumulado") {
+        // HISTORIAL Y REVISIÓN MANUAL
+        root.addView(sectionTitle("Historial y lectura manual"))
+        addText(root, "Consulta todas las notificaciones recibidas para recorrerlas una por una o escucharlas.", 15f)
+
+        root.addView(button("Ver historial de notificaciones recibidas") {
+            showHistoryDialog()
+        })
+        root.addView(button("Leer muestra del resumen en voz alta") {
             if (!appEnabled) {
                 toast("MFSD Notification está desactivada. Actívala para escuchar una muestra.")
             } else {
@@ -219,17 +296,17 @@ class MainActivity : Activity() {
                 val recent = NotificationStore.readAll(this).filter { it.postedAt > from && it.postedAt <= now }
                 val message = NotificationStore.buildSummary(this, recent)
                 TtsSpeaker.speak(this, message)
-                toast("He enviado el resumen a la voz seleccionada.")
+                toast("Reproduciendo muestra de resumen.")
             }
         })
-        root.addView(button("Borrar el historial guardado de notificaciones") {
+        root.addView(button("Borrar historial guardado") {
             NotificationStore.clear(this)
             toast("Historial borrado del teléfono.")
         })
-        addText(root, "Privacidad: el contenido de las notificaciones se procesa y guarda localmente en este teléfono. Esta aplicación no necesita conexión a Internet. Si Android oculta el contenido de un aviso, la aplicación tampoco puede leerlo.", 15f)
-        addText(root, "Nota sobre WhatsApp: el número de mensajes de grupos y chats es aproximado. Android puede agrupar mensajes y no siempre informa qué conversación es un grupo.", 15f)
-        addText(root, "Limitación de Android: se reciben las notificaciones que el sistema entrega a los servicios de acceso a notificaciones. Los avisos permanentes, como la reproducción multimedia o algunos servicios en primer plano, se excluyen porque pueden actualizarse continuamente.", 15f)
 
+        addText(root, "Privacidad: el contenido de las notificaciones se procesa exclusivamente en tu teléfono, sin conexión a Internet.", 14f)
+
+        // Listeners para spinners de voz y audio
         engineSpinner.onItemSelectedListener = SimpleItemSelectedListener { position ->
             if (position in engineChoices.indices) {
                 NotificationStore.prefs(this).edit()
@@ -245,13 +322,9 @@ class MainActivity : Activity() {
             }
             NotificationStore.prefs(this).edit().putString(NotificationStore.KEY_AUDIO_MODE, mode).apply()
         }
-        engineSpinner.tag = "engine_spinner"
-        audioSpinner.tag = "audio_spinner"
-        root.tag = "root_layout"
-        // Los adaptadores se asignan al terminar de crear toda la pantalla.
     }
 
-    private fun loadAppChoicesAndChecks() {
+    private fun loadAppChoices() {
         val combinedChoices = LinkedHashMap<String, AppChoice>()
         findLaunchableApps().forEach { combinedChoices[it.packageName] = it }
         NotificationStore.readAll(this).forEach { record ->
@@ -260,37 +333,98 @@ class MainActivity : Activity() {
             }
         }
         appChoices = combinedChoices.values.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
+
         val prefs = NotificationStore.prefs(this)
         val stored = prefs.getStringSet(NotificationStore.KEY_SELECTED_APPS, null)
-        val selected = if (stored == null) {
-            appChoices.filter { it.packageName == "com.whatsapp" || it.packageName == "com.whatsapp.w4b" }
-                .map { it.packageName }.toSet().also { NotificationStore.saveSelectedPackages(this, it) }
-        } else stored.toSet()
+        if (stored == null) {
+            val defaults = appChoices.filter { it.packageName == "com.whatsapp" || it.packageName == "com.whatsapp.w4b" }
+                .map { it.packageName }.toSet()
+            NotificationStore.saveSelectedPackages(this, defaults)
+        }
+        updateAppSummaryText()
+    }
 
-        buildingAppList = true
-        selectedAppsContainer.removeAllViews()
+    private fun updateAppSummaryText() {
+        if (!::appsSummaryStatus.isInitialized) return
+        val selected = NotificationStore.selectedPackages(this)
+        val total = appChoices.size
+        val count = selected.intersect(appChoices.map { it.packageName }.toSet()).size
+        appsSummaryStatus.text = "Aplicaciones marcadas para lectura inmediata: $count de $total disponibles."
+        appsSummaryStatus.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
+    }
+
+    private fun showAppSelectionDialog() {
         if (appChoices.isEmpty()) {
-            selectedAppsContainer.addView(label("Todavía no hay aplicaciones para elegir. El resumen seguirá reuniendo las notificaciones que lleguen de las aplicaciones del teléfono."), matchWrap())
-        } else {
-            for (choice in appChoices) {
-                val check = CheckBox(this).apply {
-                    text = choice.label
-                    textSize = 17f
-                    minHeight = dp(54)
-                    setPadding(dp(2), dp(8), dp(2), dp(8))
-                    isChecked = choice.packageName in selected
-                    contentDescription = "Leer notificaciones de ${choice.label}"
-                    setOnCheckedChangeListener { _, checked ->
-                        if (buildingAppList) return@setOnCheckedChangeListener
-                        val now = NotificationStore.selectedPackages(this@MainActivity).toMutableSet()
-                        if (checked) now.add(choice.packageName) else now.remove(choice.packageName)
-                        NotificationStore.saveSelectedPackages(this@MainActivity, now)
+            toast("No hay aplicaciones disponibles en este momento.")
+            return
+        }
+        val currentSelected = NotificationStore.selectedPackages(this).toMutableSet()
+        val labels = appChoices.map { it.label }.toTypedArray()
+        val checked = appChoices.map { it.packageName in currentSelected }.toBooleanArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Seleccionar aplicaciones para lectura inmediata")
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
+                val pkg = appChoices[which].packageName
+                if (isChecked) currentSelected.add(pkg) else currentSelected.remove(pkg)
+            }
+            .setPositiveButton("Guardar") { dialog, _ ->
+                NotificationStore.saveSelectedPackages(this, currentSelected)
+                updateAppSummaryText()
+                toast("Preferencias de aplicaciones guardadas.")
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun showHistoryDialog() {
+        val records = NotificationStore.readAll(this).reversed()
+        if (records.isEmpty()) {
+            toast("El historial está vacío. No hay notificaciones guardadas todavía.")
+            return
+        }
+        val timeFormat = DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault())
+        val items = records.map { r ->
+            val time = timeFormat.format(Date(r.postedAt))
+            val titlePart = if (r.title.isNotBlank()) " | ${r.title}" else ""
+            val bodyPart = if (r.text.isNotBlank()) ": ${r.text}" else ""
+            "[$time] ${r.appName}$titlePart$bodyPart"
+        }.toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Historial: ${records.size} notificaciones (pulsa una para escucharla)")
+            .setItems(items) { _, which ->
+                val selected = records[which]
+                TtsSpeaker.speak(this, selected.spokenText())
+                toast("Leyendo notificación de ${selected.appName}")
+            }
+            .setPositiveButton("Cerrar", null)
+            .show()
+    }
+
+    private fun requestBatteryOptimizationExemption() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (powerManager != null && !powerManager.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    } catch (_: Exception) {
+                        toast("En Ajustes > Batería desactiva la optimización para MFSD Notification.")
                     }
                 }
-                selectedAppsContainer.addView(check, matchWrap())
+            } else {
+                toast("La optimización de batería ya está desactivada para MFSD Notification.")
             }
+        } else {
+            toast("Tu versión de Android no requiere esta configuración de batería.")
         }
-        buildingAppList = false
     }
 
     private fun findLaunchableApps(): List<AppChoice> {
@@ -358,9 +492,9 @@ class MainActivity : Activity() {
     }
 
     private fun masterStatusText(): String = if (appEnabled) {
-        "Estado general: activada. La lectura inmediata y los resúmenes pueden funcionar según tus preferencias."
+        "Estado general: activada. Supervisando notificaciones."
     } else {
-        "Estado general: desactivada. No se leerán notificaciones ni se reproducirán resúmenes."
+        "Estado general: desactivada (en pausa). No se leerá nada."
     }
 
     private fun masterButtonText(): String = if (appEnabled) {
@@ -379,13 +513,16 @@ class MainActivity : Activity() {
             val summaryEnabled = NotificationStore.prefs(this)
                 .getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)
             if (summaryEnabled) SummaryScheduler.startFromNow(this) else SummaryScheduler.stop(this)
-            toast("MFSD Notification activada. Empieza un nuevo periodo de notificaciones.")
+            if (NotificationStore.prefs(this).getBoolean(NotificationStore.KEY_KEEP_ALIVE, true)) {
+                KeepAliveService.start(this)
+            }
+            toast("MFSD Notification activada.")
         } else {
-            // El próximo resumen no incluirá eventos anteriores a la desactivación.
             NotificationStore.moveSummaryCutoffToNow(this)
             SummaryScheduler.stop(this)
+            KeepAliveService.stop(this)
             TtsSpeaker.stop()
-            toast("MFSD Notification desactivada. Se detuvo la voz y no se leerá nada hasta activarla.")
+            toast("MFSD Notification desactivada. Se detuvo la voz y las tareas de fondo.")
         }
 
         masterStatus.text = masterStatusText()
@@ -404,9 +541,9 @@ class MainActivity : Activity() {
             component != null && component.packageName == expected.packageName && component.className == expected.className
         }
         accessStatus.text = if (enabled) {
-            "Estado del acceso a notificaciones: activado. MFSD Notification puede recibir las notificaciones permitidas por Android."
+            "Estado del acceso a notificaciones: activado correctamente."
         } else {
-            "Estado del acceso a notificaciones: desactivado. Pulsa el botón siguiente y activa MFSD Notification en la lista de Android."
+            "Estado del acceso a notificaciones: desactivado. Pulsa el botón inferior para conceder acceso."
         }
         accessStatus.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
     }
@@ -449,7 +586,6 @@ class MainActivity : Activity() {
     private fun matchWrap() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
     private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
-
 }
 
 private class SimpleItemSelectedListener(val onSelected: (Int) -> Unit) : android.widget.AdapterView.OnItemSelectedListener {
