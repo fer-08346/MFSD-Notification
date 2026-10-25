@@ -229,6 +229,66 @@ class MainActivity : Activity() {
         }
         root.addView(summarySwitch, matchWrap())
 
+        // COMPORTAMIENTO INTELIGENTE Y COMODIDAD
+        root.addView(sectionTitle("Comportamiento inteligente"))
+        addText(root, "Ajustes para evitar interrupciones incómodas y lecturas repetitivas.", 15f)
+
+        val musicSwitch = Switch(this).apply {
+            text = "No interrumpir si estoy escuchando música"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_PAUSE_ON_MUSIC, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_PAUSE_ON_MUSIC, checked).apply()
+            }
+        }
+        root.addView(musicSwitch, matchWrap())
+
+        val dndSwitch = Switch(this).apply {
+            text = "Pausar en Modo Sueño o No Molestar"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_DND_SLEEP_MODE, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_DND_SLEEP_MODE, checked).apply()
+            }
+        }
+        root.addView(dndSwitch, matchWrap())
+
+        val proximitySwitch = Switch(this).apply {
+            text = "Silenciar pasando la mano (sensor de proximidad)"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_PROXIMITY_SILENCE, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_PROXIMITY_SILENCE, checked).apply()
+            }
+        }
+        root.addView(proximitySwitch, matchWrap())
+
+        val antiSpamSwitch = Switch(this).apply {
+            text = "Evitar repeticiones y avisos seguidos (anti-spam)"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_ANTI_SPAM, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_ANTI_SPAM, checked).apply()
+            }
+        }
+        root.addView(antiSpamSwitch, matchWrap())
+
         // CONFIGURACIÓN DE VOZ
         root.addView(sectionTitle("Voz independiente"))
         addText(root, "Selecciona el motor de voz deseado (como Eloquence, Vocalizer o Samsung) y el volumen a emplear.", 15f)

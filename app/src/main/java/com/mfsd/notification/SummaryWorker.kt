@@ -1,6 +1,8 @@
 package com.mfsd.notification
 
+import android.app.NotificationManager
 import android.content.Context
+import android.media.AudioManager
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
@@ -55,21 +57,35 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
             !prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)) return Result.success()
 
         // Se programa al comenzar el ciclo para conservar una cadencia cercana a 30 minutos.
-        // APPEND impide que este siguiente trabajo se ejecute antes de que termine el actual.
         try { SummaryScheduler.enqueueNext(app) } catch (_: Exception) { }
 
+        // Si el usuario está escuchando música, no interrumpir con el resumen
+        val pauseOnMusic = prefs.getBoolean(NotificationStore.KEY_PAUSE_ON_MUSIC, true)
+        val audioManager = app.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (pauseOnMusic && audioManager?.isMusicActive == true) {
+            return Result.success()
+        }
+
+        // Si el teléfono está en Modo Sueño o No Molestar, no emitir sonido
+        val dndSleepEnabled = prefs.getBoolean(NotificationStore.KEY_DND_SLEEP_MODE, true)
+        val notificationManager = app.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        if (dndSleepEnabled && notificationManager != null) {
+            val filter = notificationManager.currentInterruptionFilter
+            if (filter != NotificationManager.INTERRUPTION_FILTER_ALL &&
+                filter != NotificationManager.INTERRUPTION_FILTER_UNKNOWN) {
+                return Result.success()
+            }
+        }
+
         try {
-            if (!prefs.getBoolean(NotificationStore.KEY_MASTER_ENABLED, true) ||
-                !prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)) return Result.success()
             val cutoff = System.currentTimeMillis()
             val last = prefs.getLong(NotificationStore.KEY_LAST_SUMMARY_AT, cutoff - TimeUnit.MINUTES.toMillis(30))
             val events = NotificationStore.readAll(app).filter { it.postedAt > last && it.postedAt <= cutoff }
             val summary = NotificationStore.buildSummary(app, events)
             val spoken = TtsSpeaker.speakAndWait(app, summary)
             if (spoken) NotificationStore.finishSummary(app, cutoff)
-            // Si la síntesis falla, los registros se conservan para volver a intentarlo en el próximo ciclo.
         } catch (_: Exception) {
-            // Un fallo en un resumen no debe detener definitivamente la cadena de resúmenes.
+            // Un fallo en un resumen no debe detener la cadena
         }
         return Result.success()
     }

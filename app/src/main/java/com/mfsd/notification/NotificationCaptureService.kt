@@ -1,19 +1,27 @@
 package com.mfsd.notification
 
 import android.app.Notification
+import android.content.Context
+import android.media.AudioManager
 import android.os.Build
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.text.TextUtils
 import java.util.Locale
 
-/** Recibe y procesa las notificaciones de Android. */
+/** Recibe y procesa las notificaciones de Android de forma inteligente. */
 class NotificationCaptureService : NotificationListenerService() {
+
+    private data class LastSpoken(val contentHash: String, val timeMs: Long)
+
+    companion object {
+        // Guarda el último contenido hablado por aplicación para evitar repeticiones (ej. Telegram o WhatsApp)
+        private val recentSpokenByPackage = HashMap<String, LastSpoken>()
+        private val lock = Any()
+    }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
-        // Al conectar el servicio, capturamos las notificaciones ya presentes en el sistema
-        // para que no se omitan en el historial ni en los resúmenes.
         try {
             val active = activeNotifications ?: return
             for (sbn in active) {
@@ -37,16 +45,14 @@ class NotificationCaptureService : NotificationListenerService() {
         val summaryEnabled = prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)
         if (!instantRead && !summaryEnabled) return
 
-        // Omitir únicamente notificaciones de reproducción multimedia activa
+        // Omitir notificaciones de reproductores de música activa
         val extras = sbn.notification.extras
         val isMediaPlayback = extras?.containsKey(Notification.EXTRA_MEDIA_SESSION) == true ||
             sbn.notification.category == Notification.CATEGORY_TRANSPORT
         if (isMediaPlayback) return
 
-        // Extraer título
         val rawTitle = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty().trim()
 
-        // Extraer texto revisando múltiples estilos y campos posibles
         val rawText = when {
             extras?.getCharSequence(Notification.EXTRA_BIG_TEXT) != null ->
                 extras.getCharSequence(Notification.EXTRA_BIG_TEXT).toString()
@@ -63,7 +69,6 @@ class NotificationCaptureService : NotificationListenerService() {
             else -> ""
         }.trim()
 
-        // Si no hay ningún contenido textual, omitir
         if (rawTitle.isBlank() && rawText.isBlank()) return
 
         val appLabel = try {
@@ -96,20 +101,64 @@ class NotificationCaptureService : NotificationListenerService() {
             visibleMessageCount = messageCount
         )
 
-        // Registrar para el resumen y el historial
+        // Registrar en el historial para los resúmenes y lectura manual
         if (summaryEnabled) NotificationStore.add(this, record)
 
-        // Lectura al instante si la aplicación está seleccionada
+        // Lectura al instante
         val isAppSelected = sbn.packageName in NotificationStore.selectedPackages(this)
         if (canSpeakInstantly && instantRead && isAppSelected) {
+            // 1. Detectar si el usuario está escuchando música
+            val pauseOnMusic = prefs.getBoolean(NotificationStore.KEY_PAUSE_ON_MUSIC, true)
+            if (pauseOnMusic) {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                if (audioManager?.isMusicActive == true) {
+                    return // No interrumpir la música con la voz
+                }
+            }
+
+            // 2. Detectar si el teléfono está en Modo Sueño o No Molestar (DND)
+            val dndSleepEnabled = prefs.getBoolean(NotificationStore.KEY_DND_SLEEP_MODE, true)
+            if (dndSleepEnabled && isSleepOrDndActive()) {
+                return // Respetar el descanso y el silencio
+            }
+
             val mode = prefs.getString(NotificationStore.KEY_INSTANT_MODE, NotificationStore.INSTANT_MODE_FULL)
             val speech = if (mode == NotificationStore.INSTANT_MODE_BRIEF) {
                 record.spokenBrief()
             } else {
                 record.spokenText()
             }
+
+            // 3. Sistema Anti-Spam y Anti-Repetición (para Telegram, chats activos, etc.)
+            val antiSpamEnabled = prefs.getBoolean(NotificationStore.KEY_ANTI_SPAM, true)
+            if (antiSpamEnabled) {
+                val now = System.currentTimeMillis()
+                val hash = "${record.title}|${record.text}".trim()
+                synchronized(lock) {
+                    val last = recentSpokenByPackage[sbn.packageName]
+                    if (last != null) {
+                        // Si es exactamente el mismo texto hace menos de 25 segundos, no repetir
+                        if (last.contentHash == hash && (now - last.timeMs) < 25_000L) {
+                            return
+                        }
+                        // Si llegan mensajes en ráfaga (menos de 2.5 segundos) de la misma app, no aturdir
+                        if ((now - last.timeMs) < 2500L) {
+                            return
+                        }
+                    }
+                    recentSpokenByPackage[sbn.packageName] = LastSpoken(hash, now)
+                }
+            }
+
             TtsSpeaker.speak(this, speech)
         }
+    }
+
+    private fun isSleepOrDndActive(): Boolean {
+        return try {
+            val filter = currentInterruptionFilter
+            filter != INTERRUPTION_FILTER_ALL && filter != INTERRUPTION_FILTER_UNKNOWN
+        } catch (_: Exception) { false }
     }
 
     private fun classifyWhatsApp(isGroup: Boolean, conversationTitle: String?, title: String, text: String, appLabel: String): Int {
