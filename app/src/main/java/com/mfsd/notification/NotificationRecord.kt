@@ -80,6 +80,8 @@ object NotificationStore {
     const val KEY_DND_SLEEP_MODE = "dnd_sleep_mode"
     const val KEY_PROXIMITY_SILENCE = "proximity_silence"
     const val KEY_ANTI_SPAM = "anti_spam"
+    const val KEY_SUMMARY_INTERVAL_MINUTES = "summary_interval_minutes"
+    const val DEFAULT_SUMMARY_INTERVAL_MINUTES = 30L
     const val KEY_EVENTS = "notification_events"
     const val KEY_LAST_SUMMARY_AT = "last_summary_at"
     const val KEY_SCHEDULER_INITIALIZED = "scheduler_initialized"
@@ -94,6 +96,24 @@ object NotificationStore {
 
     fun saveSelectedPackages(context: Context, values: Set<String>) {
         prefs(context).edit().putStringSet(KEY_SELECTED_APPS, values.toSet()).apply()
+    }
+
+    fun summaryIntervalMinutes(context: Context): Long =
+        prefs(context).getLong(KEY_SUMMARY_INTERVAL_MINUTES, DEFAULT_SUMMARY_INTERVAL_MINUTES).coerceAtLeast(1L)
+
+    fun setSummaryIntervalMinutes(context: Context, minutes: Long) {
+        prefs(context).edit().putLong(KEY_SUMMARY_INTERVAL_MINUTES, minutes.coerceAtLeast(1L)).apply()
+    }
+
+    fun intervalName(minutes: Long): String = when (minutes) {
+        1L -> "el último minuto"
+        5L -> "los últimos cinco minutos"
+        10L -> "los últimos diez minutos"
+        15L -> "los últimos quince minutos"
+        30L -> "los últimos treinta minutos"
+        60L -> "la última hora"
+        120L -> "las últimas dos horas"
+        else -> "los últimos $minutes minutos"
     }
 
     fun add(context: Context, record: NotificationRecord) {
@@ -150,11 +170,17 @@ object NotificationStore {
         }
     }
 
-    fun buildSummary(context: Context, source: List<NotificationRecord>, includeTime: Boolean = true): String {
+    fun buildSummary(
+        context: Context,
+        source: List<NotificationRecord>,
+        includeTime: Boolean = true,
+        intervalMinutes: Long = summaryIntervalMinutes(context)
+    ): String {
         val currentTime = DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault()).format(Date())
         val header = if (includeTime) "Resumen de MFSD Notification, hora $currentTime." else "Resumen de MFSD Notification."
+        val period = intervalName(intervalMinutes)
         if (source.isEmpty()) {
-            return "$header Durante los últimos treinta minutos no llegaron notificaciones nuevas."
+            return "$header Durante $period no llegaron notificaciones nuevas."
         }
 
         // Para una misma notificación agrupada, se toma la versión más reciente del intervalo.
@@ -171,8 +197,7 @@ object NotificationStore {
             }
             .sortedByDescending { it.second }
 
-        val opening = "$header Se registraron ${records.size} notificaciones en ${byApp.size} aplicaciones."
-        // Desglose de todas las aplicaciones registradas
+        val opening = "$header En $period se registraron ${records.size} notificaciones en ${byApp.size} aplicaciones."
         val appBreakdown = appCounts.joinToString(". ") { (name, count, _) -> "$name: $count avisos" }
 
         val whatsapp = records.filter { it.packageName == "com.whatsapp" || it.packageName == "com.whatsapp.w4b" }

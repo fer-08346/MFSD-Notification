@@ -10,7 +10,7 @@ import androidx.work.Worker
 import androidx.work.WorkerParameters
 import java.util.concurrent.TimeUnit
 
-private const val SUMMARY_WORK_NAME = "mfsd-notification-half-hour-summary"
+private const val SUMMARY_WORK_NAME = "mfsd-notification-summary"
 
 object SummaryScheduler {
     fun startFromNow(context: Context) {
@@ -20,13 +20,14 @@ object SummaryScheduler {
             stop(context)
             return
         }
+        val intervalMinutes = NotificationStore.summaryIntervalMinutes(context)
         prefs.edit()
             .putLong(NotificationStore.KEY_LAST_SUMMARY_AT, System.currentTimeMillis())
             .putBoolean(NotificationStore.KEY_SCHEDULER_INITIALIZED, true)
             .apply()
         WorkManager.getInstance(context).cancelUniqueWork(SUMMARY_WORK_NAME)
         val first = OneTimeWorkRequestBuilder<SummaryWorker>()
-            .setInitialDelay(30, TimeUnit.MINUTES)
+            .setInitialDelay(intervalMinutes, TimeUnit.MINUTES)
             .build()
         WorkManager.getInstance(context).enqueueUniqueWork(SUMMARY_WORK_NAME, ExistingWorkPolicy.REPLACE, first)
     }
@@ -42,8 +43,9 @@ object SummaryScheduler {
         val prefs = NotificationStore.prefs(context)
         if (!prefs.getBoolean(NotificationStore.KEY_MASTER_ENABLED, true) ||
             !prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)) return
+        val intervalMinutes = NotificationStore.summaryIntervalMinutes(context)
         val next = OneTimeWorkRequestBuilder<SummaryWorker>()
-            .setInitialDelay(30, TimeUnit.MINUTES)
+            .setInitialDelay(intervalMinutes, TimeUnit.MINUTES)
             .build()
         WorkManager.getInstance(context).enqueueUniqueWork(SUMMARY_WORK_NAME, ExistingWorkPolicy.APPEND, next)
     }
@@ -56,7 +58,7 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
         if (!prefs.getBoolean(NotificationStore.KEY_MASTER_ENABLED, true) ||
             !prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)) return Result.success()
 
-        // Se programa al comenzar el ciclo para conservar una cadencia cercana a 30 minutos.
+        // Se programa el siguiente ciclo
         try { SummaryScheduler.enqueueNext(app) } catch (_: Exception) { }
 
         // Si el usuario está escuchando música, no interrumpir con el resumen
@@ -78,10 +80,11 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
         }
 
         try {
+            val intervalMinutes = NotificationStore.summaryIntervalMinutes(app)
             val cutoff = System.currentTimeMillis()
-            val last = prefs.getLong(NotificationStore.KEY_LAST_SUMMARY_AT, cutoff - TimeUnit.MINUTES.toMillis(30))
+            val last = prefs.getLong(NotificationStore.KEY_LAST_SUMMARY_AT, cutoff - TimeUnit.MINUTES.toMillis(intervalMinutes))
             val events = NotificationStore.readAll(app).filter { it.postedAt > last && it.postedAt <= cutoff }
-            val summary = NotificationStore.buildSummary(app, events)
+            val summary = NotificationStore.buildSummary(app, events, intervalMinutes = intervalMinutes)
             val spoken = TtsSpeaker.speakAndWait(app, summary)
             if (spoken) NotificationStore.finishSummary(app, cutoff)
         } catch (_: Exception) {
