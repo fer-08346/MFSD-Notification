@@ -5,4 +5,6 @@ local.properties
 .idea/
 app/build/
 apk_compilado/
+*.apk
+release_notes.md
 
