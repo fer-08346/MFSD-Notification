@@ -2,6 +2,7 @@ package com.mfsd.notification
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.TimePickerDialog
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -47,6 +48,12 @@ class MainActivity : Activity() {
     private lateinit var summaryIntervalSpinner: Spinner
     private lateinit var instantSwitch: Switch
     private lateinit var keepAliveSwitch: Switch
+
+    // Modo sueño por horario
+    private lateinit var sleepStatusText: TextView
+    private lateinit var sleepStartButton: Button
+    private lateinit var sleepEndButton: Button
+
     private var updatingIntervalSpinner = false
     private var appEnabled = true
     private var appChoices: List<AppChoice> = emptyList()
@@ -63,6 +70,7 @@ class MainActivity : Activity() {
         loadEngines()
         refreshAccessStatus()
         refreshBatteryStatus()
+        refreshSleepStatus()
 
         val prefs = NotificationStore.prefs(this)
         if (appEnabled) {
@@ -84,6 +92,7 @@ class MainActivity : Activity() {
         super.onResume()
         if (::accessStatus.isInitialized) refreshAccessStatus()
         if (::batteryStatus.isInitialized) refreshBatteryStatus()
+        if (::sleepStatusText.isInitialized) refreshSleepStatus()
         loadAppChoices()
     }
 
@@ -121,7 +130,7 @@ class MainActivity : Activity() {
             contentDescription = "MFSD Notification, configuración principal"
         }
         root.addView(heading, matchWrap())
-        addText(root, "Lee en voz alta las notificaciones que elijas y reúne un resumen periódico. La voz se configura aparte de la que utiliza tu lector de pantalla.", 17f)
+        addText(root, "Lee en voz alta las notificaciones que elijas, anuncia llamadas y reúne un resumen periódico.", 17f)
 
         // CONTROL GENERAL
         root.addView(sectionTitle("Control general"))
@@ -131,7 +140,7 @@ class MainActivity : Activity() {
         }
         masterControlButton.contentDescription = masterButtonText()
         root.addView(masterControlButton, matchWrap())
-        addText(root, "Al desactivarla, detiene la voz inmediatamente y pausa la captura y los resúmenes. Al reactivarla, comienza un nuevo periodo.", 15f)
+        addText(root, "Al desactivarla, detiene la voz inmediatamente y pausa la captura y los resúmenes.", 15f)
 
         // PERMISOS DEL SISTEMA
         root.addView(sectionTitle("Permisos del sistema"))
@@ -178,7 +187,7 @@ class MainActivity : Activity() {
             requestBatteryOptimizationExemption()
         }
         root.addView(batteryButton, matchWrap())
-        addText(root, "Permite que la app trabaje en segundo plano sin restricciones para que el teléfono no congele las notificaciones al apagar la pantalla.", 15f)
+        addText(root, "Permite que la app trabaje en segundo plano sin restricciones para que el teléfono no congele las notificaciones.", 15f)
 
         // MODOS DE LECTURA Y RESUMEN PERSONALIZABLE
         root.addView(sectionTitle("Modos de lectura"))
@@ -270,6 +279,116 @@ class MainActivity : Activity() {
         }
         root.addView(summaryIntervalSpinner, matchWrap())
 
+        // ANUNCIO DE LLAMADAS ENTRANTES
+        root.addView(sectionTitle("Llamadas entrantes"))
+        addText(root, "Anuncia en voz alta quién te llama por teléfono o WhatsApp.", 15f)
+
+        val callAnnounceSwitch = Switch(this).apply {
+            text = "Anunciar llamadas de WhatsApp y Teléfono"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_ANNOUNCE_CALLS, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_ANNOUNCE_CALLS, checked).apply()
+            }
+        }
+        root.addView(callAnnounceSwitch, matchWrap())
+
+        root.addView(label("Canal de audio para llamadas:"))
+        val callAudioSpinner = Spinner(this).apply {
+            contentDescription = "Canal de audio para anunciar llamadas"
+            minimumHeight = dp(52)
+        }
+        val callAudioOptions = listOf("Volumen de llamada (predeterminado)", "Volumen de accesibilidad", "Volumen multimedia")
+        val callAudioAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, callAudioOptions)
+        callAudioAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        callAudioSpinner.adapter = callAudioAdapter
+        val storedCallAudio = NotificationStore.prefs(this).getString(NotificationStore.KEY_CALL_AUDIO_CHANNEL, "call")
+        callAudioSpinner.setSelection(when (storedCallAudio) { "accessibility" -> 1; "media" -> 2; else -> 0 }, false)
+        callAudioSpinner.onItemSelectedListener = SimpleItemSelectedListener { position ->
+            val mode = when (position) { 1 -> "accessibility"; 2 -> "media"; else -> "call" }
+            NotificationStore.prefs(this).edit().putString(NotificationStore.KEY_CALL_AUDIO_CHANNEL, mode).apply()
+        }
+        root.addView(callAudioSpinner, matchWrap())
+
+        root.addView(button("Probar anuncio de llamada (WhatsApp)") {
+            TtsSpeaker.speakCall(this, "Llamada de WhatsApp de Mamá")
+            toast("Prueba de llamada enviada a la voz.")
+        })
+        root.addView(button("Probar anuncio de llamada (Teléfono)") {
+            TtsSpeaker.speakCall(this, "Llamada entrante de teléfono de Juan Pérez")
+            toast("Prueba de llamada enviada a la voz.")
+        })
+
+        // HORARIO DE DESCANSO Y MODO SUEÑO
+        root.addView(sectionTitle("Horario de descanso y Modo Sueño"))
+        addText(root, "Configura horas para silenciar la app automáticamente y auto-limpiar el historial para evitar saturación.", 15f)
+
+        sleepStatusText = addText(root, "Estado del descanso: Comprobando...", 16f)
+
+        val dndSwitch = Switch(this).apply {
+            text = "Respetar Modo Sueño / No Molestar de Android"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_DND_SLEEP_MODE, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_DND_SLEEP_MODE, checked).apply()
+                refreshSleepStatus()
+            }
+        }
+        root.addView(dndSwitch, matchWrap())
+
+        val sleepScheduleSwitch = Switch(this).apply {
+            text = "Programar horario de descanso automático"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_SLEEP_SCHEDULE_ENABLED, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_SLEEP_SCHEDULE_ENABLED, checked).apply()
+                refreshSleepStatus()
+            }
+        }
+        root.addView(sleepScheduleSwitch, matchWrap())
+
+        val prefs = NotificationStore.prefs(this)
+        val startH = prefs.getInt(NotificationStore.KEY_SLEEP_START_HOUR, 22)
+        val startM = prefs.getInt(NotificationStore.KEY_SLEEP_START_MINUTE, 0)
+        sleepStartButton = button("Hora de dormir: ${NotificationStore.formatHourMinute(startH, startM)}") {
+            showTimePicker(isStartTime = true)
+        }
+        root.addView(sleepStartButton, matchWrap())
+
+        val endH = prefs.getInt(NotificationStore.KEY_SLEEP_END_HOUR, 7)
+        val endM = prefs.getInt(NotificationStore.KEY_SLEEP_END_MINUTE, 0)
+        sleepEndButton = button("Hora de despertar: ${NotificationStore.formatHourMinute(endH, endM)}") {
+            showTimePicker(isStartTime = false)
+        }
+        root.addView(sleepEndButton, matchWrap())
+
+        val autoClearSwitch = Switch(this).apply {
+            text = "Vaciar historial 5 minutos antes de dormir"
+            textSize = 17f
+            minHeight = dp(60)
+            setPadding(dp(2), dp(8), dp(2), dp(8))
+            isChecked = NotificationStore.prefs(this@MainActivity)
+                .getBoolean(NotificationStore.KEY_AUTO_CLEAR_BEFORE_SLEEP, true)
+            setOnCheckedChangeListener { _, checked ->
+                NotificationStore.prefs(this@MainActivity).edit()
+                    .putBoolean(NotificationStore.KEY_AUTO_CLEAR_BEFORE_SLEEP, checked).apply()
+            }
+        }
+        root.addView(autoClearSwitch, matchWrap())
+        addText(root, "La auto-limpieza previene que el historial acumule cientos de avisos y bloquee la app tras varios días de uso continuo.", 14f)
+
         // COMPORTAMIENTO INTELIGENTE Y COMODIDAD
         root.addView(sectionTitle("Comportamiento inteligente"))
         addText(root, "Ajustes para evitar interrupciones incómodas y lecturas repetitivas.", 15f)
@@ -287,20 +406,6 @@ class MainActivity : Activity() {
             }
         }
         root.addView(musicSwitch, matchWrap())
-
-        val dndSwitch = Switch(this).apply {
-            text = "Pausar en Modo Sueño o No Molestar"
-            textSize = 17f
-            minHeight = dp(60)
-            setPadding(dp(2), dp(8), dp(2), dp(8))
-            isChecked = NotificationStore.prefs(this@MainActivity)
-                .getBoolean(NotificationStore.KEY_DND_SLEEP_MODE, true)
-            setOnCheckedChangeListener { _, checked ->
-                NotificationStore.prefs(this@MainActivity).edit()
-                    .putBoolean(NotificationStore.KEY_DND_SLEEP_MODE, checked).apply()
-            }
-        }
-        root.addView(dndSwitch, matchWrap())
 
         val proximitySwitch = Switch(this).apply {
             text = "Silenciar pasando la mano (sensor de proximidad)"
@@ -424,6 +529,50 @@ class MainActivity : Activity() {
             }
             NotificationStore.prefs(this).edit().putString(NotificationStore.KEY_AUDIO_MODE, mode).apply()
         }
+    }
+
+    private fun showTimePicker(isStartTime: Boolean) {
+        val p = NotificationStore.prefs(this)
+        val currentH = if (isStartTime) p.getInt(NotificationStore.KEY_SLEEP_START_HOUR, 22)
+                       else p.getInt(NotificationStore.KEY_SLEEP_END_HOUR, 7)
+        val currentM = if (isStartTime) p.getInt(NotificationStore.KEY_SLEEP_START_MINUTE, 0)
+                       else p.getInt(NotificationStore.KEY_SLEEP_END_MINUTE, 0)
+
+        TimePickerDialog(this, { _, hourOfDay, minute ->
+            if (isStartTime) {
+                p.edit().putInt(NotificationStore.KEY_SLEEP_START_HOUR, hourOfDay)
+                    .putInt(NotificationStore.KEY_SLEEP_START_MINUTE, minute).apply()
+                sleepStartButton.text = "Hora de dormir: ${NotificationStore.formatHourMinute(hourOfDay, minute)}"
+                sleepStartButton.contentDescription = sleepStartButton.text
+            } else {
+                p.edit().putInt(NotificationStore.KEY_SLEEP_END_HOUR, hourOfDay)
+                    .putInt(NotificationStore.KEY_SLEEP_END_MINUTE, minute).apply()
+                sleepEndButton.text = "Hora de despertar: ${NotificationStore.formatHourMinute(hourOfDay, minute)}"
+                sleepEndButton.contentDescription = sleepEndButton.text
+            }
+            refreshSleepStatus()
+            toast("Horario actualizado.")
+        }, currentH, currentM, false).show()
+    }
+
+    private fun refreshSleepStatus() {
+        if (!::sleepStatusText.isInitialized) return
+        val isSleepNow = NotificationStore.isSleepTimeNow(this)
+        val p = NotificationStore.prefs(this)
+        val scheduleOn = p.getBoolean(NotificationStore.KEY_SLEEP_SCHEDULE_ENABLED, true)
+        val startH = p.getInt(NotificationStore.KEY_SLEEP_START_HOUR, 22)
+        val startM = p.getInt(NotificationStore.KEY_SLEEP_START_MINUTE, 0)
+        val endH = p.getInt(NotificationStore.KEY_SLEEP_END_HOUR, 7)
+        val endM = p.getInt(NotificationStore.KEY_SLEEP_END_MINUTE, 0)
+
+        val desc = when {
+            isSleepNow -> "Estado del descanso: En horario de sueño (silenciado actualmente)."
+            scheduleOn -> "Estado del descanso: Activo (silencio programado de ${NotificationStore.formatHourMinute(startH, startM)} a ${NotificationStore.formatHourMinute(endH, endM)})."
+            else -> "Estado del descanso: Horario programado desactivado."
+        }
+        sleepStatusText.text = desc
+        sleepStatusText.contentDescription = desc
+        sleepStatusText.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
     }
 
     private fun summaryIntervalDescription(): String {

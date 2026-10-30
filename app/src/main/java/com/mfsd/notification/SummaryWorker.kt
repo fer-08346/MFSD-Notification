@@ -61,6 +61,9 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
         // Se programa el siguiente ciclo
         try { SummaryScheduler.enqueueNext(app) } catch (_: Exception) { }
 
+        // Auto-limpieza si estamos cerca de la hora de dormir
+        NotificationStore.checkAndPerformAutoClear(app)
+
         // Si el usuario está escuchando música, no interrumpir con el resumen
         val pauseOnMusic = prefs.getBoolean(NotificationStore.KEY_PAUSE_ON_MUSIC, true)
         val audioManager = app.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -68,7 +71,11 @@ class SummaryWorker(context: Context, params: WorkerParameters) : Worker(context
             return Result.success()
         }
 
-        // Si el teléfono está en Modo Sueño o No Molestar, no emitir sonido
+        // Si el teléfono está en horario de sueño o Modo No Molestar, no emitir sonido
+        if (NotificationStore.isSleepTimeNow(app)) {
+            return Result.success()
+        }
+
         val dndSleepEnabled = prefs.getBoolean(NotificationStore.KEY_DND_SLEEP_MODE, true)
         val notificationManager = app.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         if (dndSleepEnabled && notificationManager != null) {

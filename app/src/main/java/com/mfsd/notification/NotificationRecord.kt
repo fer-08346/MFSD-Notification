@@ -5,6 +5,8 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.DateFormat
+import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
@@ -82,10 +84,26 @@ object NotificationStore {
     const val KEY_ANTI_SPAM = "anti_spam"
     const val KEY_SUMMARY_INTERVAL_MINUTES = "summary_interval_minutes"
     const val DEFAULT_SUMMARY_INTERVAL_MINUTES = 30L
+
+    // Modo sueño por horario programado
+    const val KEY_SLEEP_SCHEDULE_ENABLED = "sleep_schedule_enabled"
+    const val KEY_SLEEP_START_HOUR = "sleep_start_hour"
+    const val KEY_SLEEP_START_MINUTE = "sleep_start_minute"
+    const val KEY_SLEEP_END_HOUR = "sleep_end_hour"
+    const val KEY_SLEEP_END_MINUTE = "sleep_end_minute"
+    const val KEY_AUTO_CLEAR_BEFORE_SLEEP = "auto_clear_before_sleep"
+    private const val KEY_LAST_AUTO_CLEARED_DATE = "last_auto_cleared_date"
+
+    // Anuncio de llamadas entrantes
+    const val KEY_ANNOUNCE_CALLS = "announce_calls"
+    const val KEY_CALL_AUDIO_CHANNEL = "call_audio_channel"
+
     const val KEY_EVENTS = "notification_events"
     const val KEY_LAST_SUMMARY_AT = "last_summary_at"
     const val KEY_SCHEDULER_INITIALIZED = "scheduler_initialized"
-    private const val MAX_EVENTS = 1000
+
+    // Reducido a 150 para que el almacenamiento sea ultra ligero y nunca bloquee el hilo ni la memoria
+    private const val MAX_EVENTS = 150
     private val lock = Any()
 
     fun prefs(context: Context): SharedPreferences =
@@ -116,16 +134,87 @@ object NotificationStore {
         else -> "los últimos $minutes minutos"
     }
 
+    /**
+     * Verifica si actualmente el teléfono se encuentra en el horario de sueño configurado.
+     */
+    fun isSleepTimeNow(context: Context): Boolean {
+        val p = prefs(context)
+        if (!p.getBoolean(KEY_DND_SLEEP_MODE, true)) return false
+        if (!p.getBoolean(KEY_SLEEP_SCHEDULE_ENABLED, true)) return false
+
+        val cal = Calendar.getInstance()
+        val currentMinutes = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        val startMinutes = p.getInt(KEY_SLEEP_START_HOUR, 22) * 60 + p.getInt(KEY_SLEEP_START_MINUTE, 0)
+        val endMinutes = p.getInt(KEY_SLEEP_END_HOUR, 7) * 60 + p.getInt(KEY_SLEEP_END_MINUTE, 0)
+
+        return if (startMinutes < endMinutes) {
+            currentMinutes in startMinutes until endMinutes
+        } else {
+            // Cruza la medianoche (por ejemplo, de 22:00 a 07:00)
+            currentMinutes >= startMinutes || currentMinutes < endMinutes
+        }
+    }
+
+    /**
+     * Comprueba y ejecuta la auto-limpieza del historial 5 minutos antes de la hora de dormir.
+     * Evita que el historial crezca durante días y congele la aplicación.
+     */
+    fun checkAndPerformAutoClear(context: Context) {
+        val p = prefs(context)
+        if (!p.getBoolean(KEY_AUTO_CLEAR_BEFORE_SLEEP, true)) return
+        if (!p.getBoolean(KEY_SLEEP_SCHEDULE_ENABLED, true)) return
+
+        val cal = Calendar.getInstance()
+        val currentMinutes = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        val startMinutes = p.getInt(KEY_SLEEP_START_HOUR, 22) * 60 + p.getInt(KEY_SLEEP_START_MINUTE, 0)
+
+        // 5 minutos antes de la hora de inicio de dormir
+        val clearThreshold = (startMinutes - 5 + 1440) % 1440
+        val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        val lastCleared = p.getString(KEY_LAST_AUTO_CLEARED_DATE, "")
+
+        // Se ejecuta si estamos en la ventana previa o dentro del inicio de sueño y no se ha purgado hoy
+        val isTimeForClear = if (startMinutes >= 5) {
+            currentMinutes in clearThreshold..startMinutes
+        } else {
+            currentMinutes >= clearThreshold || currentMinutes <= startMinutes
+        }
+
+        if (isTimeForClear && lastCleared != todayStr) {
+            clear(context)
+            p.edit().putString(KEY_LAST_AUTO_CLEARED_DATE, todayStr).apply()
+        }
+    }
+
+    fun formatHourMinute(hour: Int, minute: Int): String {
+        val cal = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, hour)
+            set(Calendar.MINUTE, minute)
+        }
+        return DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault()).format(cal.time)
+    }
+
     fun add(context: Context, record: NotificationRecord) {
         synchronized(lock) {
-            val prefs = prefs(context)
-            val old = try { JSONArray(prefs.getString(KEY_EVENTS, "[]") ?: "[]") }
+            val p = prefs(context)
+            val old = try { JSONArray(p.getString(KEY_EVENTS, "[]") ?: "[]") }
                        catch (_: Exception) { JSONArray() }
-            old.put(record.toJson())
+
+            // Purgar notificaciones de más de 24 horas para mantener la base de datos veloz
+            val cutoff24h = System.currentTimeMillis() - (24 * 3600 * 1000L)
+            val filtered = JSONArray()
+            for (i in 0 until old.length()) {
+                val item = try { old.getJSONObject(i) } catch (_: Exception) { continue }
+                if (item.optLong("postedAt") >= cutoff24h) {
+                    filtered.put(item)
+                }
+            }
+
+            filtered.put(record.toJson())
             val trimmed = JSONArray()
-            val start = (old.length() - MAX_EVENTS).coerceAtLeast(0)
-            for (i in start until old.length()) trimmed.put(old.getJSONObject(i))
-            prefs.edit().putString(KEY_EVENTS, trimmed.toString()).apply()
+            val start = (filtered.length() - MAX_EVENTS).coerceAtLeast(0)
+            for (i in start until filtered.length()) trimmed.put(filtered.getJSONObject(i))
+            p.edit().putString(KEY_EVENTS, trimmed.toString()).apply()
         }
     }
 
@@ -155,15 +244,15 @@ object NotificationStore {
     /** Avanza el corte y conserva cualquier evento que haya llegado después de él. */
     fun finishSummary(context: Context, cutoff: Long) {
         synchronized(lock) {
-            val prefs = prefs(context)
-            val raw = prefs.getString(KEY_EVENTS, "[]") ?: "[]"
+            val p = prefs(context)
+            val raw = p.getString(KEY_EVENTS, "[]") ?: "[]"
             val array = try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
             val remaining = JSONArray()
             for (i in 0 until array.length()) {
                 val item = try { array.getJSONObject(i) } catch (_: Exception) { continue }
                 if (item.optLong("postedAt") > cutoff) remaining.put(item)
             }
-            prefs.edit()
+            p.edit()
                 .putString(KEY_EVENTS, remaining.toString())
                 .putLong(KEY_LAST_SUMMARY_AT, cutoff)
                 .apply()
@@ -183,7 +272,6 @@ object NotificationStore {
             return "$header Durante $period no llegaron notificaciones nuevas."
         }
 
-        // Para una misma notificación agrupada, se toma la versión más reciente del intervalo.
         val latestByKey = LinkedHashMap<String, NotificationRecord>()
         source.sortedBy { it.postedAt }.forEach { record ->
             latestByKey[record.packageName + "|" + record.key] = record

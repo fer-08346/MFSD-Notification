@@ -15,8 +15,9 @@ class NotificationCaptureService : NotificationListenerService() {
     private data class LastSpoken(val contentHash: String, val timeMs: Long)
 
     companion object {
-        // Guarda el último contenido hablado por aplicación para evitar repeticiones (ej. Telegram o WhatsApp)
         private val recentSpokenByPackage = HashMap<String, LastSpoken>()
+        private var lastCallKey = ""
+        private var lastCallTime = 0L
         private val lock = Any()
     }
 
@@ -41,12 +42,11 @@ class NotificationCaptureService : NotificationListenerService() {
         val prefs = NotificationStore.prefs(this)
         if (!prefs.getBoolean(NotificationStore.KEY_MASTER_ENABLED, true)) return
 
-        val instantRead = prefs.getBoolean(NotificationStore.KEY_READ_INSTANTLY, true)
-        val summaryEnabled = prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)
-        if (!instantRead && !summaryEnabled) return
+        // 1. Ejecutar auto-limpieza preventiva si estamos a 5 minutos del modo sueño
+        NotificationStore.checkAndPerformAutoClear(this)
 
-        // Omitir notificaciones de reproductores de música activa
         val extras = sbn.notification.extras
+        // Omitir notificaciones de reproductores multimedia activos
         val isMediaPlayback = extras?.containsKey(Notification.EXTRA_MEDIA_SESSION) == true ||
             sbn.notification.category == Notification.CATEGORY_TRANSPORT
         if (isMediaPlayback) return
@@ -76,6 +76,55 @@ class NotificationCaptureService : NotificationListenerService() {
             packageManager.getApplicationLabel(info).toString()
         } catch (_: Exception) { sbn.packageName }
 
+        // 2. DETECCIÓN Y ANUNCIO DE LLAMADAS ENTRANTES (Teléfono y WhatsApp)
+        val announceCalls = prefs.getBoolean(NotificationStore.KEY_ANNOUNCE_CALLS, true)
+        val isWhatsApp = sbn.packageName == "com.whatsapp" || sbn.packageName == "com.whatsapp.w4b"
+        val isDialer = sbn.packageName.contains("dialer", ignoreCase = true) ||
+            sbn.packageName.contains("incallui", ignoreCase = true) ||
+            sbn.packageName.contains("telecom", ignoreCase = true)
+
+        val combinedLower = "$rawTitle $rawText".lowercase(Locale.ROOT)
+        val isCallCategory = sbn.notification.category == Notification.CATEGORY_CALL
+        val hasCallWord = combinedLower.contains("llamada") ||
+            combinedLower.contains("incoming call") ||
+            combinedLower.contains("videollamada")
+
+        val isIncomingCall = isCallCategory || (isWhatsApp && hasCallWord) || (isDialer && hasCallWord)
+
+        if (isIncomingCall && announceCalls && canSpeakInstantly) {
+            // No anunciar si estamos en modo sueño o No Molestar
+            if (!isQuietSleepOrDndActive()) {
+                val caller = when {
+                    rawTitle.isNotBlank() && !rawTitle.equals("WhatsApp", true) && !rawTitle.equals(appLabel, true) -> rawTitle
+                    rawText.isNotBlank() && !rawText.contains("llamada", true) -> rawText
+                    else -> "desconocido"
+                }
+
+                val announcement = when {
+                    isWhatsApp -> "Llamada de WhatsApp de $caller"
+                    isDialer || isCallCategory -> "Llamada entrante de teléfono de $caller"
+                    else -> "Llamada entrante de $appLabel de $caller"
+                }
+
+                // Debouncing de llamadas: anunciar cada 7 segundos como máximo para no aturdir ni pelear con el timbre
+                val now = System.currentTimeMillis()
+                val callKey = "${sbn.packageName}|$caller"
+                synchronized(lock) {
+                    if (lastCallKey != callKey || (now - lastCallTime) > 7000L) {
+                        lastCallKey = callKey
+                        lastCallTime = now
+                        TtsSpeaker.speakCall(this, announcement)
+                    }
+                }
+            }
+            return
+        }
+
+        // 3. FLUJO HABITUAL DE NOTIFICACIONES
+        val instantRead = prefs.getBoolean(NotificationStore.KEY_READ_INSTANTLY, true)
+        val summaryEnabled = prefs.getBoolean(NotificationStore.KEY_SUMMARY_ENABLED, true)
+        if (!instantRead && !summaryEnabled) return
+
         val isGroup = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             extras?.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION) ?: false
         } else {
@@ -84,7 +133,6 @@ class NotificationCaptureService : NotificationListenerService() {
         val conversationTitle = extras?.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()
         val messagesCount = extras?.getParcelableArray(Notification.EXTRA_MESSAGES)?.size ?: 1
 
-        val isWhatsApp = sbn.packageName == "com.whatsapp" || sbn.packageName == "com.whatsapp.w4b"
         val groupKind = if (isWhatsApp) classifyWhatsApp(isGroup, conversationTitle, rawTitle, rawText, appLabel) else -1
         val countFromText = Regex("(?i)\\b(\\d+)\\s+(?:mensajes?|messages?)\\b")
             .find(rawText)?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -107,19 +155,18 @@ class NotificationCaptureService : NotificationListenerService() {
         // Lectura al instante
         val isAppSelected = sbn.packageName in NotificationStore.selectedPackages(this)
         if (canSpeakInstantly && instantRead && isAppSelected) {
-            // 1. Detectar si el usuario está escuchando música
+            // Verificar si el usuario está escuchando música
             val pauseOnMusic = prefs.getBoolean(NotificationStore.KEY_PAUSE_ON_MUSIC, true)
             if (pauseOnMusic) {
                 val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 if (audioManager?.isMusicActive == true) {
-                    return // No interrumpir la música con la voz
+                    return
                 }
             }
 
-            // 2. Detectar si el teléfono está en Modo Sueño o No Molestar (DND)
-            val dndSleepEnabled = prefs.getBoolean(NotificationStore.KEY_DND_SLEEP_MODE, true)
-            if (dndSleepEnabled && isSleepOrDndActive()) {
-                return // Respetar el descanso y el silencio
+            // Verificar si está en Modo Sueño (por horario programado o por DND nativo)
+            if (isQuietSleepOrDndActive()) {
+                return
             }
 
             val mode = prefs.getString(NotificationStore.KEY_INSTANT_MODE, NotificationStore.INSTANT_MODE_FULL)
@@ -129,7 +176,7 @@ class NotificationCaptureService : NotificationListenerService() {
                 record.spokenText()
             }
 
-            // 3. Sistema Anti-Spam y Anti-Repetición (para Telegram, chats activos, etc.)
+            // Sistema Anti-Spam y Anti-Repetición
             val antiSpamEnabled = prefs.getBoolean(NotificationStore.KEY_ANTI_SPAM, true)
             if (antiSpamEnabled) {
                 val now = System.currentTimeMillis()
@@ -137,11 +184,9 @@ class NotificationCaptureService : NotificationListenerService() {
                 synchronized(lock) {
                     val last = recentSpokenByPackage[sbn.packageName]
                     if (last != null) {
-                        // Si es exactamente el mismo texto hace menos de 25 segundos, no repetir
                         if (last.contentHash == hash && (now - last.timeMs) < 25_000L) {
                             return
                         }
-                        // Si llegan mensajes en ráfaga (menos de 2.5 segundos) de la misma app, no aturdir
                         if ((now - last.timeMs) < 2500L) {
                             return
                         }
@@ -154,11 +199,25 @@ class NotificationCaptureService : NotificationListenerService() {
         }
     }
 
-    private fun isSleepOrDndActive(): Boolean {
-        return try {
-            val filter = currentInterruptionFilter
-            filter != INTERRUPTION_FILTER_ALL && filter != INTERRUPTION_FILTER_UNKNOWN
-        } catch (_: Exception) { false }
+    /**
+     * Devuelve verdadero si la aplicación debe silenciarse por estar en Modo Sueño
+     * (sea por el horario programado o por el modo No Molestar nativo de Android).
+     */
+    private fun isQuietSleepOrDndActive(): Boolean {
+        // 1. Por horario programado de sueño en el reloj
+        if (NotificationStore.isSleepTimeNow(this)) return true
+
+        // 2. Por modo No Molestar nativo de Android
+        val prefs = NotificationStore.prefs(this)
+        if (prefs.getBoolean(NotificationStore.KEY_DND_SLEEP_MODE, true)) {
+            try {
+                val filter = currentInterruptionFilter
+                if (filter != INTERRUPTION_FILTER_ALL && filter != INTERRUPTION_FILTER_UNKNOWN) {
+                    return true
+                }
+            } catch (_: Exception) { }
+        }
+        return false
     }
 
     private fun classifyWhatsApp(isGroup: Boolean, conversationTitle: String?, title: String, text: String, appLabel: String): Int {

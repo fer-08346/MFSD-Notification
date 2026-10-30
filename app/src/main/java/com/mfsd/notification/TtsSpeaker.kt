@@ -16,11 +16,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** Administra una síntesis de voz elegida por la usuaria, independiente del motor de TalkBack. */
 object TtsSpeaker {
-    private data class QueuedSpeech(val text: String, val onFinished: ((Boolean) -> Unit)?)
+    private data class QueuedSpeech(
+        val text: String,
+        val isCall: Boolean = false,
+        val onFinished: ((Boolean) -> Unit)? = null
+    )
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pending = ArrayDeque<QueuedSpeech>()
     private val callbacks = HashMap<String, (Boolean) -> Unit>()
+    private val timeoutRunnables = HashMap<String, Runnable>()
     private var tts: TextToSpeech? = null
     private var activeEngine = "__not_initialized__"
     private var ready = false
@@ -28,13 +33,28 @@ object TtsSpeaker {
 
     fun speak(context: Context, text: String) {
         if (!NotificationStore.prefs(context).getBoolean(NotificationStore.KEY_MASTER_ENABLED, true)) return
-        enqueue(context, text, null)
+        enqueue(context, text, isCall = false, onFinished = null)
+    }
+
+    /**
+     * Anuncia una llamada entrante de inmediato con prioridad sobre otras notificaciones,
+     * deteniendo la cola anterior y utilizando un canal de audio confortable.
+     */
+    fun speakCall(context: Context, text: String) {
+        if (!NotificationStore.prefs(context).getBoolean(NotificationStore.KEY_MASTER_ENABLED, true)) return
+        mainHandler.post {
+            // Cancelar notificaciones de lectura que estuvieran pendientes para priorizar la llamada
+            pending.clear()
+            try { tts?.stop() } catch (_: Exception) { }
+            enqueue(context, text, isCall = true, onFinished = null)
+        }
     }
 
     /** Detiene de inmediato la voz actual y vacía la cola. */
     fun stop() {
         mainHandler.post {
             ProximitySilencer.stopListening()
+            clearTimeouts()
             val queuedCallbacks = pending.mapNotNull { it.onFinished }
             pending.clear()
             try { tts?.stop() } catch (_: Exception) { }
@@ -50,7 +70,7 @@ object TtsSpeaker {
     fun speakAndWait(context: Context, text: String, timeoutSeconds: Long = 90L): Boolean {
         val latch = CountDownLatch(1)
         val success = AtomicBoolean(false)
-        enqueue(context, text) { ok ->
+        enqueue(context, text, isCall = false) { ok ->
             success.set(ok)
             latch.countDown()
         }
@@ -62,7 +82,7 @@ object TtsSpeaker {
         }
     }
 
-    private fun enqueue(context: Context, text: String, onFinished: ((Boolean) -> Unit)?) {
+    private fun enqueue(context: Context, text: String, isCall: Boolean, onFinished: ((Boolean) -> Unit)?) {
         val app = context.applicationContext
         appContext = app
         mainHandler.post {
@@ -71,23 +91,22 @@ object TtsSpeaker {
                 return@post
             }
 
-            // Anti-acumulación: si ya hay 2 mensajes esperando en cola, descartamos los antiguos
-            // para evitar que se quede hablando repetitivamente.
-            if (pending.size >= 2) {
+            // Anti-acumulación: si no es llamada y ya hay 2 mensajes esperando, descartamos los viejos
+            if (!isCall && pending.size >= 2) {
                 val dropped = pending.removeFirst()
                 dropped.onFinished?.invoke(false)
             }
 
-            pending.addLast(QueuedSpeech(text, onFinished))
+            pending.addLast(QueuedSpeech(text, isCall, onFinished))
 
-            // Iniciar sensor de proximidad mientras hay lectura pendiente o activa
+            // Activar sensor de proximidad mientras hay locución
             ProximitySilencer.startListening(app)
 
             val selectedEngine = NotificationStore.prefs(app).getString(NotificationStore.KEY_TTS_ENGINE, "") ?: ""
-            if (tts == null || selectedEngine != activeEngine) {
+            if (tts == null || selectedEngine != activeEngine || !ready) {
                 recreateEngine(app, selectedEngine)
-            } else if (ready) {
-                tts?.let { configure(it, app) }
+            } else {
+                configureAudio(tts!!, app, isCall)
                 drainQueue()
             }
         }
@@ -105,7 +124,8 @@ object TtsSpeaker {
                 val current = tts ?: return@post
                 if (status == TextToSpeech.SUCCESS) {
                     ready = true
-                    configure(current, context)
+                    val nextIsCall = pending.firstOrNull()?.isCall ?: false
+                    configureAudio(current, context, nextIsCall)
                     current.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) = Unit
                         override fun onDone(utteranceId: String?) { finishUtterance(utteranceId, true) }
@@ -127,8 +147,14 @@ object TtsSpeaker {
               else TextToSpeech(context, listener, enginePackage)
     }
 
-    private fun configure(engine: TextToSpeech, context: Context) {
-        val audioMode = NotificationStore.prefs(context).getString(NotificationStore.KEY_AUDIO_MODE, "accessibility")
+    private fun configureAudio(engine: TextToSpeech, context: Context, isCall: Boolean) {
+        val prefs = NotificationStore.prefs(context)
+        val audioMode = if (isCall) {
+            prefs.getString(NotificationStore.KEY_CALL_AUDIO_CHANNEL, "call")
+        } else {
+            prefs.getString(NotificationStore.KEY_AUDIO_MODE, "accessibility")
+        }
+
         val usage = when (audioMode) {
             "call" -> AudioAttributes.USAGE_VOICE_COMMUNICATION
             "media" -> AudioAttributes.USAGE_MEDIA
@@ -159,21 +185,43 @@ object TtsSpeaker {
             val item = pending.removeFirst()
             val id = UUID.randomUUID().toString()
             if (item.onFinished != null) callbacks[id] = item.onFinished
+
+            // Watchdog: temporizador de seguridad de 14 segundos para evitar que utterances
+            // colgados bloqueen el motor si el servicio de TTS nunca llama a onDone
+            val watchdog = Runnable {
+                finishUtterance(id, false)
+            }
+            timeoutRunnables[id] = watchdog
+            mainHandler.postDelayed(watchdog, 14000L)
+
             val result = try {
                 engine.speak(item.text, TextToSpeech.QUEUE_ADD, Bundle(), id)
-            } catch (_: Exception) { TextToSpeech.ERROR }
-            if (result == TextToSpeech.ERROR) finishUtterance(id, false)
+            } catch (_: Exception) {
+                TextToSpeech.ERROR
+            }
+
+            if (result == TextToSpeech.ERROR) {
+                // Auto-recuperación si el motor falló: marcar como no listo para recrearlo limpiamente
+                ready = false
+                finishUtterance(id, false)
+                appContext?.let { recreateEngine(it, activeEngine) }
+            }
         }
     }
 
     private fun finishUtterance(id: String?, successful: Boolean) {
         if (id == null) return
         mainHandler.post {
+            timeoutRunnables.remove(id)?.let { mainHandler.removeCallbacks(it) }
             callbacks.remove(id)?.invoke(successful)
-            // Si ya no hay nada pendiente ni reproduciéndose, apagamos el sensor de proximidad
             if (callbacks.isEmpty() && pending.isEmpty()) {
                 ProximitySilencer.stopListening()
             }
         }
+    }
+
+    private fun clearTimeouts() {
+        timeoutRunnables.values.forEach { mainHandler.removeCallbacks(it) }
+        timeoutRunnables.clear()
     }
 }
